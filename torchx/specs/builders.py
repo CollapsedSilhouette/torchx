@@ -10,7 +10,7 @@ import argparse
 import inspect
 import os
 from argparse import Namespace
-from typing import Any, Callable, Dict, List, Mapping, Optional, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 from torchx.specs.api import BindMount, MountType, VolumeMount
 from torchx.specs.file_linter import get_fn_docstring, TorchXArgumentHelpFormatter
@@ -140,6 +140,62 @@ def parse_args(
     return parsed_args
 
 
+def parse_and_decode_args(
+    cmpnt_fn: Callable[..., Any],  # pyre-fixme[2]: Enforce AppDef type
+    cmpnt_args: list[str],
+    cmpnt_args_defaults: Optional[Dict[str, Any]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """
+    Parses and decodes command-line arguments for a component function.
+
+    This function takes a component function and its arguments, parses them using argparse,
+    and decodes the arguments into their expected types based on the function's signature.
+    It separates positional arguments, variable positional arguments (*args), and keyword-only arguments.
+
+    Args:
+        cmpnt_fn: The component function whose arguments are to be parsed and decoded.
+        cmpnt_args: List of command-line arguments to be parsed.
+        cmpnt_args_defaults: Optional dictionary of default values for the component function's parameters.
+        config: Optional dictionary containing additional configuration values.
+
+    Returns:
+        A tuple containing:
+            - positional_args: Dictionary of positional and positional-or-keyword arguments.
+            - var_args: List of variable positional arguments (*args).
+            - kwargs: Dictionary of keyword-only arguments.
+    """
+    parsed_args = parse_args(cmpnt_fn, cmpnt_args, cmpnt_args_defaults, config)
+
+    positional_args = {}
+    var_args = []
+    kwargs = {}
+
+    parameters = inspect.signature(cmpnt_fn).parameters
+    for param_name, parameter in parameters.items():
+        arg_value = getattr(parsed_args, param_name)
+        parameter_type = parameter.annotation
+        parameter_type = decode_optional(parameter_type)
+        arg_value = decode(arg_value, parameter_type)
+        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            var_args = arg_value
+        elif parameter.kind == inspect.Parameter.KEYWORD_ONLY:
+            kwargs[param_name] = arg_value
+        elif parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            raise TypeError(
+                f"component fn param `{param_name}` is a '**kwargs' which is not supported; consider changing the "
+                f"type to a dict or explicitly declare the params"
+            )
+        else:
+            # POSITIONAL or POSITIONAL_OR_KEYWORD
+            positional_args[param_name] = arg_value
+
+    if len(var_args) > 0 and var_args[0] == "--":
+        var_args = var_args[1:]
+
+    return positional_args, var_args, kwargs
+
+
 def materialize_appdef(
     cmpnt_fn: Callable[..., Any],  # pyre-ignore[2]
     cmpnt_args: List[str],
@@ -174,30 +230,12 @@ def materialize_appdef(
         An application spec
     """
 
-    function_args = []
-    var_arg = []
-    kwargs = {}
+    positional_args, args, kwargs = parse_and_decode_args(
+        cmpnt_fn, cmpnt_args, cmpnt_defaults, config
+    )
+    positional_arg_values = list(positional_args.values())
+    appdef = cmpnt_fn(*positional_arg_values, *args, **kwargs)
 
-    parsed_args = parse_args(cmpnt_fn, cmpnt_args, cmpnt_defaults, config)
-
-    parameters = inspect.signature(cmpnt_fn).parameters
-    for param_name, parameter in parameters.items():
-        arg_value = getattr(parsed_args, param_name)
-        parameter_type = parameter.annotation
-        parameter_type = decode_optional(parameter_type)
-        arg_value = decode(arg_value, parameter_type)
-        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
-            var_arg = arg_value
-        elif parameter.kind == inspect.Parameter.KEYWORD_ONLY:
-            kwargs[param_name] = arg_value
-        elif parameter.kind == inspect.Parameter.VAR_KEYWORD:
-            raise TypeError("**kwargs are not supported for component definitions")
-        else:
-            function_args.append(arg_value)
-    if len(var_arg) > 0 and var_arg[0] == "--":
-        var_arg = var_arg[1:]
-
-    appdef = cmpnt_fn(*function_args, *var_arg, **kwargs)
     if not isinstance(appdef, AppDef):
         raise TypeError(
             f"Expected a component that returns `AppDef`, but got `{type(appdef)}`"
